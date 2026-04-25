@@ -1,0 +1,65 @@
+name: biliflow-detect
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    env:
+      ROOM_ID: ${{ vars.ROOM_ID || secrets.ROOM_ID }}
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Validate room id
+        run: |
+          if [ -z "${ROOM_ID}" ]; then
+            echo "ROOM_ID 未配置，请在仓库 Variables 或 Secrets 中设置 ROOM_ID"
+            exit 1
+          fi
+
+      - name: Check live status
+        id: live
+        run: scripts/check_live.sh
+
+      - name: Stop when offline
+        if: steps.live.outputs.is_live != 'true'
+        run: echo "直播间未开播，结束本次检测。"
+
+      - name: Check recorder idle state
+        if: steps.live.outputs.is_live == 'true'
+        id: recorder
+        run: scripts/check_recorder_idle.sh
+
+      - name: Stop when recorder is busy
+        if: steps.live.outputs.is_live == 'true' && steps.recorder.outputs.recorder_idle != 'true'
+        run: echo "录制 workflow 正在运行或排队，跳过重复派发。"
+
+      - name: Dispatch recorder workflow
+        if: steps.live.outputs.is_live == 'true' && steps.recorder.outputs.recorder_idle == 'true'
+        env:
+          LIVE_TITLE: ${{ steps.live.outputs.live_title }}
+        run: |
+          gh workflow run record.yml \
+            -f room_id="${ROOM_ID}" \
+            -f session_id="" \
+            -f segment_index="1" \
+            -f live_title="${LIVE_TITLE}"
+
