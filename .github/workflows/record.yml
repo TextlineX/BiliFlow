@@ -183,6 +183,7 @@ jobs:
           - danmaku.jsonl
           - danmaku.csv
           - search-index.json
+          - summary.json
           - danmaku.srt（若生成成功）
           EOF
           {
@@ -228,6 +229,7 @@ jobs:
           - ASS：本地播放器弹幕
           - JSONL/CSV：原始弹幕与搜索导出
           - search-index.json：搜索索引
+          - summary.json：本段统计摘要
           EOF
           echo "description_file=${description_file}" >> "${GITHUB_OUTPUT}"
 
@@ -259,4 +261,3 @@ jobs:
           SEGMENT_INDEX: ${{ steps.init.outputs.segment_index }}
           LIVE_TITLE: ${{ steps.recheck.outputs.live_title }}
         run: scripts/handoff.sh
-

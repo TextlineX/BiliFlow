@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -40,7 +41,7 @@ def resolve_room(room_id: str) -> tuple[int, str, int]:
     host_list = danmu_data.get("host_list") or []
 
     if not host_list:
-      raise RuntimeError("未获取到弹幕服务器地址")
+        raise RuntimeError("未获取到弹幕服务器地址")
 
     host_info = host_list[0]
     host = host_info.get("host")
@@ -48,7 +49,7 @@ def resolve_room(room_id: str) -> tuple[int, str, int]:
     token = danmu_data.get("token")
 
     if not host or not port or not token:
-      raise RuntimeError("弹幕服务器信息不完整")
+        raise RuntimeError("弹幕服务器信息不完整")
 
     return real_room_id, f"wss://{host}:{port}/sub", token
 
@@ -100,7 +101,21 @@ def safe_int(value, default: int = 0) -> int:
         return default
 
 
-def normalize_danmaku(payload: dict, start_ms: int) -> dict | None:
+def normalize_timestamp_ms(value, fallback_ms: int) -> int:
+    timestamp = safe_int(value, fallback_ms)
+    if timestamp <= 0:
+        return fallback_ms
+    if timestamp < 10_000_000_000:
+        return timestamp * 1000
+    return timestamp
+
+
+def write_json_line(handle, payload: dict) -> None:
+    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    handle.flush()
+
+
+def normalize_danmaku(payload: dict, start_ms: int, observed_ms: int) -> dict | None:
     cmd = str(payload.get("cmd") or "")
     base_cmd = cmd.split(":", 1)[0]
     if base_cmd != "DANMU_MSG":
@@ -116,8 +131,15 @@ def normalize_danmaku(payload: dict, start_ms: int) -> dict | None:
     mode = safe_int(meta[1] if len(meta) > 1 else 1, 1)
     font_size = safe_int(meta[2] if len(meta) > 2 else 25, 25)
     color = safe_int(meta[3] if len(meta) > 3 else 16777215, 16777215)
-    timestamp_ms = safe_int(meta[4] if len(meta) > 4 else int(time.time() * 1000))
-    user_hash = str(meta[7]) if len(meta) > 7 and meta[7] else sha1(user_id.encode("utf-8")).hexdigest()[:8]
+    timestamp_ms = normalize_timestamp_ms(
+        meta[4] if len(meta) > 4 else observed_ms,
+        observed_ms,
+    )
+    user_hash = (
+        str(meta[7])
+        if len(meta) > 7 and meta[7]
+        else sha1(user_id.encode("utf-8")).hexdigest()[:8]
+    )
     row_id = str(meta[9]) if len(meta) > 9 else str(timestamp_ms)
 
     return {
@@ -139,69 +161,150 @@ def normalize_danmaku(payload: dict, start_ms: int) -> dict | None:
 async def heartbeat(ws, stop_event: asyncio.Event, interval: int):
     while not stop_event.is_set():
         await asyncio.sleep(interval)
-        await ws.send(pack_packet(b"[object Object]", 2))
+        if stop_event.is_set():
+            break
+        try:
+            await ws.send(pack_packet(b"[object Object]", 2))
+        except websockets.ConnectionClosed:
+            break
 
 
-async def capture(room_id: str, output_path: str, heartbeat_interval: int):
-    real_room_id, ws_url, token = resolve_room(room_id)
+def register_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            continue
+
+
+def build_system_event(
+    event: str,
+    room_id: str,
+    attempt: int,
+    ws_url: str = "",
+    detail: str = "",
+) -> dict:
+    payload = {
+        "kind": "system",
+        "event": event,
+        "timestamp_ms": int(time.time() * 1000),
+        "room_id": str(room_id),
+        "attempt": attempt,
+    }
+    if ws_url:
+        payload["ws_url"] = ws_url
+    if detail:
+        payload["detail"] = detail
+    return payload
+
+
+async def capture(room_id: str, output_path: str, heartbeat_interval: int, reconnect_delay: int):
     stop_event = asyncio.Event()
     start_ms = int(time.time() * 1000)
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
-
-    auth_body = json.dumps(
-        {
-            "uid": 0,
-            "roomid": real_room_id,
-            "protover": 3,
-            "platform": "web",
-            "type": 2,
-            "key": token,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    register_signal_handlers(loop, stop_event)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
-        await ws.send(pack_packet(auth_body, 7))
-        heartbeat_task = asyncio.create_task(heartbeat(ws, stop_event, heartbeat_interval))
+    with open(output_path, "a", encoding="utf-8") as handle:
+        write_json_line(
+            handle,
+            {
+                "kind": "session",
+                "requested_room_id": str(room_id),
+                "captured_at_ms": start_ms,
+                "heartbeat_interval": heartbeat_interval,
+                "reconnect_delay": reconnect_delay,
+            },
+        )
 
-        metadata = {
-            "kind": "session",
-            "room_id": str(real_room_id),
-            "captured_at_ms": start_ms,
-            "ws_url": ws_url,
-        }
+        attempt = 0
+        while not stop_event.is_set():
+            attempt += 1
+            reconnect_needed = False
+            disconnect_detail = ""
+            real_room_id = room_id
+            ws_url = ""
 
-        with open(output_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(metadata, ensure_ascii=False) + "\n")
-            handle.flush()
+            try:
+                real_room_id, ws_url, token = resolve_room(room_id)
+                write_json_line(
+                    handle,
+                    build_system_event("connected", str(real_room_id), attempt, ws_url=ws_url),
+                )
 
-            while not stop_event.is_set():
-                try:
-                    raw_message = await asyncio.wait_for(ws.recv(), timeout=heartbeat_interval + 10)
-                except asyncio.TimeoutError:
-                    continue
-                except websockets.ConnectionClosed:
-                    break
+                auth_body = json.dumps(
+                    {
+                        "uid": 0,
+                        "roomid": real_room_id,
+                        "protover": 3,
+                        "platform": "web",
+                        "type": 2,
+                        "key": token,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
 
-                if not isinstance(raw_message, (bytes, bytearray)):
-                    continue
+                async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
+                    await ws.send(pack_packet(auth_body, 7))
+                    heartbeat_task = asyncio.create_task(
+                        heartbeat(ws, stop_event, heartbeat_interval)
+                    )
 
-                for version, operation, _, body in iter_packets(raw_message):
-                    for payload in decode_payload(version, operation, body):
-                        item = normalize_danmaku(payload, start_ms)
-                        if not item:
-                            continue
-                        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-                        handle.flush()
+                    try:
+                        while not stop_event.is_set():
+                            try:
+                                raw_message = await asyncio.wait_for(
+                                    ws.recv(),
+                                    timeout=heartbeat_interval + 10,
+                                )
+                            except asyncio.TimeoutError:
+                                continue
+                            except websockets.ConnectionClosed as exc:
+                                reconnect_needed = not stop_event.is_set()
+                                disconnect_detail = f"connection_closed:{exc.code}"
+                                break
 
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
+                            if not isinstance(raw_message, (bytes, bytearray)):
+                                continue
+
+                            observed_ms = int(time.time() * 1000)
+                            for version, operation, _, body in iter_packets(raw_message):
+                                for payload in decode_payload(version, operation, body):
+                                    item = normalize_danmaku(payload, start_ms, observed_ms)
+                                    if not item:
+                                        continue
+                                    write_json_line(handle, item)
+                    finally:
+                        heartbeat_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await heartbeat_task
+            except Exception as exc:
+                reconnect_needed = not stop_event.is_set()
+                disconnect_detail = f"{type(exc).__name__}: {exc}"
+
+            if stop_event.is_set():
+                break
+
+            if not reconnect_needed:
+                break
+
+            write_json_line(
+                handle,
+                build_system_event(
+                    "disconnected",
+                    str(real_room_id),
+                    attempt,
+                    ws_url=ws_url,
+                    detail=disconnect_detail,
+                ),
+            )
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=max(1, reconnect_delay))
+            except asyncio.TimeoutError:
+                continue
 
 
 def main():
@@ -209,13 +312,18 @@ def main():
     parser.add_argument("--room-id", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--heartbeat", type=int, default=30)
+    parser.add_argument("--reconnect-delay", type=int, default=5)
     args = parser.parse_args()
 
-    asyncio.run(capture(args.room_id, args.output, args.heartbeat))
+    asyncio.run(
+        capture(
+            args.room_id,
+            args.output,
+            args.heartbeat,
+            args.reconnect_delay,
+        )
+    )
 
 
 if __name__ == "__main__":
-    import contextlib
-
     main()
-

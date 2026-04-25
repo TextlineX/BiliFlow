@@ -20,7 +20,12 @@ if [[ ! -d "${RELEASE_DIR}" ]]; then
   exit 1
 fi
 
-mapfile -t assets < <(find "${RELEASE_DIR}" -maxdepth 1 -type f | sort)
+find_args=("${RELEASE_DIR}" -maxdepth 1 -type f)
+if [[ -n "${RELEASE_NOTES_FILE:-}" && -f "${RELEASE_NOTES_FILE}" ]]; then
+  find_args+=( ! -name "$(basename "${RELEASE_NOTES_FILE}")" )
+fi
+
+mapfile -t assets < <(find "${find_args[@]}" | sort)
 
 if [[ "${#assets[@]}" -eq 0 ]]; then
   echo "没有可上传的 Release 资源" >&2
@@ -47,4 +52,3 @@ release_url="$(gh release view "${RELEASE_TAG}" --json url --jq .url)"
 append_output "release_tag" "${RELEASE_TAG}"
 append_output "release_url" "${release_url}"
 echo "Release 已发布：${release_url}"
-
